@@ -1,0 +1,32 @@
+# Goes inside the 443 server {} block for share.example.com.
+# If you previously proxied /upload to port 80, remove that block: port 80 is now the admin page.
+#
+# Replace 10.0.0.2 with the letterslot host's address (e.g. its WireGuard IP).
+# proxy_pass has no URI part, so /dl/... and /upload/ reach the backend unchanged.
+
+location /dl/ {
+    proxy_pass http://10.0.0.2:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_buffering off;            # stream, don't spool big files to disk here
+    proxy_max_temp_file_size 0;
+    proxy_read_timeout 1h;
+}
+
+location /upload/ {
+    proxy_pass http://10.0.0.2:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    client_max_body_size 2g;        # keep in step with -max-upload
+    proxy_request_buffering off;    # stream uploads straight through
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
+}
