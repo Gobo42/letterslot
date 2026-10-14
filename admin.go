@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"html/template"
 	"io/fs"
 	"log/slog"
@@ -20,6 +22,7 @@ import (
 func (s *server) adminMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.adminIndex)
+	mux.HandleFunc("GET /version", s.adminVersion)
 	mux.HandleFunc("POST /link", s.adminCreateLink)
 	mux.HandleFunc("POST /revoke", s.adminRevoke)
 	mux.HandleFunc("POST /unblock", s.adminUnblock)
@@ -79,10 +82,9 @@ type uploadRow struct {
 	IP       string
 }
 
-func (s *server) adminIndex(w http.ResponseWriter, r *http.Request) {
-	now := time.Now()
+// scanFiles lists the shared files dir (regular files, dotfiles skipped), in lexical order.
+func (s *server) scanFiles() []*fileRow {
 	var files []*fileRow
-	byPath := map[string]*fileRow{}
 	err := fs.WalkDir(s.files.FS(), ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -100,13 +102,47 @@ func (s *server) adminIndex(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return nil
 		}
-		fr := &fileRow{Path: p, Size: fi.Size(), Mod: fi.ModTime()}
-		files = append(files, fr)
-		byPath[p] = fr
+		files = append(files, &fileRow{Path: p, Size: fi.Size(), Mod: fi.ModTime()})
 		return nil
 	})
 	if err != nil {
 		slog.Error("walk files", "err", err)
+	}
+	return files
+}
+
+// version fingerprints the files and incoming dirs (name, size, mtime);
+// the admin page polls it to know when to reload.
+func (s *server) version() string {
+	h := fnv.New64a()
+	for _, f := range s.scanFiles() {
+		fmt.Fprintf(h, "f\x00%s\x00%d\x00%d\n", f.Path, f.Size, f.Mod.UnixNano())
+	}
+	if ents, err := fs.ReadDir(s.incoming.FS(), "."); err == nil {
+		for _, e := range ents {
+			if !e.Type().IsRegular() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			if fi, err := e.Info(); err == nil {
+				fmt.Fprintf(h, "i\x00%s\x00%d\x00%d\n", e.Name(), fi.Size(), fi.ModTime().UnixNano())
+			}
+		}
+	}
+	return strconv.FormatUint(h.Sum64(), 36)
+}
+
+func (s *server) adminVersion(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(s.version()))
+}
+
+func (s *server) adminIndex(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	files := s.scanFiles()
+	byPath := map[string]*fileRow{}
+	for _, f := range files {
+		byPath[f.Path] = f
 	}
 
 	var orphans []linkRow
@@ -163,7 +199,7 @@ func (s *server) adminIndex(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	err = adminTmpl.Execute(w, map[string]any{
+	err := adminTmpl.Execute(w, map[string]any{
 		"Files":    files,
 		"Orphans":  orphans,
 		"Uploads":  uploads,
@@ -171,6 +207,7 @@ func (s *server) adminIndex(w http.ResponseWriter, r *http.Request) {
 		"FilesDir": s.cfg.FilesDir,
 		"Free":     humanSize(freeBytes(s.cfg.FilesDir)),
 		"Flash":    r.URL.Query().Get("msg"),
+		"Version":  s.version(),
 	})
 	if err != nil {
 		slog.Error("render admin", "err", err)
@@ -385,7 +422,7 @@ th,td{text-align:left;padding:6px 10px;border-top:1px solid var(--line);vertical
 th{border-top:0;color:var(--muted);font-weight:500}
 td.name{word-break:break-all}
 .empty{padding:14px;color:var(--muted)}
-</style></head><body><main>
+</style></head><body data-v="{{.Version}}"><main>
 <div class="top"><h1>letterslot</h1><span class="muted">{{.FilesDir}} · {{.Free}} free</span></div>
 {{with .Flash}}<div class="flash">{{.}}</div>{{end}}
 
@@ -451,6 +488,25 @@ td.name{word-break:break-all}
 {{else}}<div class="card"><div class="empty">None.</div></div>{{end}}
 </main>
 <script>
+// Drop ?msg= so a reload doesn't re-show a stale flash.
+if(location.search)history.replaceState(null,'',location.pathname+location.hash);
+// Reload when shared files or uploads change, once the change has held for two
+// polls (so a file still being written doesn't reload every tick), unless
+// you're mid-edit on a form.
+let seen;
+setInterval(async()=>{
+  if(document.hidden)return;
+  const a=document.activeElement;
+  if(a&&a.matches('input[type=text]:not([readonly]),select'))return;
+  if([...document.querySelectorAll('input[name=note]')].some(i=>i.value))return;
+  try{
+    const r=await fetch('/version',{cache:'no-store'});
+    if(!r.ok)return;
+    const v=await r.text();
+    if(v!==document.body.dataset.v&&v===seen)location.reload();
+    seen=v;
+  }catch(e){}
+},5000);
 function cp(b){
   const i=b.previousElementSibling; i.select();
   const done=()=>{const t=b.textContent;b.textContent='Copied';setTimeout(()=>b.textContent=t,1200)};
